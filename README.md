@@ -28,6 +28,7 @@
 9. **Custom HackBGRT UEFI Boot Logo**: Integrates the custom [splash.bmp](file:///home/gustavo/p/pessimoConsole/splash.bmp) boot logo to replace the default Windows boot logo automatically using HackBGRT's batch installer mode (requires disabling Secure Boot).
 10. **Playnite Custom Shell Integration**: Bypasses the default Windows desktop shell (`explorer.exe`) entirely to boot straight into Playnite's 10-foot console-like user interface. Exiting Playnite automatically exits the mouse mapper and launches `explorer.exe` to bring back the desktop.
 11. **Controller Mouse Emulation**: Downloads and integrates **Gopher360** to allow controlling the Windows mouse cursor and clicks using a standard game controller to handle launcher updates, installations, or dialog popups.
+12. **Optional RomM Integration**: If you have a self-hosted [RomM](https://romm.app) server, the setup installs the official [RomM Playnite plugin](https://github.com/rommapp/playnite-plugin) and pre-configures your server URL and credentials (API token or username/password). Emulator mappings still have to be added once in Playnite Desktop mode (Library → Configure Integrations → RomM), followed by Library → Import RomM library.
 
 ---
 
