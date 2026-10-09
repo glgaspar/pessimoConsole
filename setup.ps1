@@ -10,8 +10,9 @@
     - 3: Windows 10 Console Debloat & Optimization (PessimaIdeia Signature Edition)
     - 4: Playnite Installation (Auto-downloads if missing)
     - 5: Game Launchers Selection & Auto-installation (Winget + direct download)
-    - 6: HackBGRT Setup (Auto-downloads, copies splash.bmp, runs in batch mode)
-    - 7: Playnite Console Boot Mode (Autostart vs Custom Shell, with recovery option)
+    - 6: RomM Integration (optional: installs the RomM Playnite plugin and pre-configures server + credentials)
+    - 7: HackBGRT Setup (Auto-downloads, copies splash.bmp, runs in batch mode)
+    - 8: Playnite Console Boot Mode (Autostart vs Custom Shell, with recovery option)
 #>
 
 # ==========================================
@@ -27,7 +28,6 @@ Set-ExecutionPolicy Unrestricted -Scope Process -Force
 $ScriptDir = $PSScriptRoot
 
 [Net.ServicePointManager]::SecurityProtocol = 3072 -bor 12288
-[Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 
 function Download-File {
     param (
@@ -59,7 +59,7 @@ Write-Host "${BrandAccent}==========================================${ResetColor
 # ==========================================
 # MODULE 1: POWER & LID SETTINGS
 # ==========================================
-Write-Host "`n${BrandGreen}[1/7] Applying Power & Lid Behavior Settings...${ResetColor}"
+Write-Host "`n${BrandGreen}[1/8] Applying Power & Lid Behavior Settings...${ResetColor}"
 
 powercfg /s 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
 powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 2>$null
@@ -82,12 +82,16 @@ Set-ItemProperty -Path $DesktopPath -Name "ScreenSaverIsSecure" -Value "0"
 Remove-ItemProperty -Path $DesktopPath -Name "SCRNSAVE.EXE" -ErrorAction SilentlyContinue
 
 powercfg /setactive SCHEME_CURRENT
-Write-Host "${BrandDark}-> Power set to High Performance. Lid closure sleep, standby, hibernate, and screen timeouts disabled.${ResetColor}"
+
+# Deletes hiberfil.sys (frees disk space equal to a large fraction of RAM) and disables Fast Startup,
+# which often leaves Bluetooth/USB controllers in a bad state after shutdown
+powercfg /h off 2>$null
+Write-Host "${BrandDark}-> Power set to High Performance. Lid closure sleep, standby, hibernation, Fast Startup, and screen timeouts disabled.${ResetColor}"
 
 # ==========================================
 # MODULE 2: AUTOMATIC USER LOGON
 # ==========================================
-Write-Host "`n${BrandGreen}[2/7] Configuring Auto-Logon for TV Console Experience...${ResetColor}"
+Write-Host "`n${BrandGreen}[2/8] Configuring Auto-Logon for TV Console Experience...${ResetColor}"
 $WinLogonPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
 
 $DefaultUser = $env:UserName
@@ -97,18 +101,49 @@ if ([string]::IsNullOrWhiteSpace($TargetUser)) { $TargetUser = $DefaultUser }
 $TargetPass = Read-Host "Enter Password for $TargetUser (Leave blank if no password)" -AsSecureString
 $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($TargetPass)
 $PlainPass = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
+[System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
 
-Set-ItemProperty -Path $WinLogonPath -Name "AutoAdminLogon" -Value "1"
-Set-ItemProperty -Path $WinLogonPath -Name "DefaultUserName" -Value $TargetUser
-Set-ItemProperty -Path $WinLogonPath -Name "DefaultPassword" -Value $PlainPass
+# Prefer Sysinternals Autologon, which stores the password encrypted as an LSA secret
+# instead of in plain text under Winlogon\DefaultPassword
+$AutologonConfigured = $false
+if (-not [string]::IsNullOrEmpty($PlainPass)) {
+    $AutologonDir = Join-Path -Path $ScriptDir -ChildPath "Autologon"
+    $AutologonZip = Join-Path -Path $ScriptDir -ChildPath "AutoLogon.zip"
+    $ProgressPreference = 'SilentlyContinue'
+    try {
+        Write-Host "${BrandYellow}-> Downloading Sysinternals Autologon...${ResetColor}"
+        Download-File -Uri "https://download.sysinternals.com/files/AutoLogon.zip" -Path $AutologonZip
+        Expand-Archive -Path $AutologonZip -DestinationPath $AutologonDir -Force
+        $AutologonExe = Join-Path -Path $AutologonDir -ChildPath $(if ([Environment]::Is64BitOperatingSystem) { "Autologon64.exe" } else { "Autologon.exe" })
+        # Reset first so a value left by a previous run can't make a failed Autologon look successful
+        Set-ItemProperty -Path $WinLogonPath -Name "AutoAdminLogon" -Value "0"
+        Start-Process -FilePath $AutologonExe -ArgumentList "`"$TargetUser`"", "`"$env:USERDOMAIN`"", "`"$PlainPass`"", "/accepteula" -Wait -WindowStyle Hidden
+        if ((Get-ItemProperty -Path $WinLogonPath -Name "AutoAdminLogon" -ErrorAction SilentlyContinue).AutoAdminLogon -eq "1") {
+            Remove-ItemProperty -Path $WinLogonPath -Name "DefaultPassword" -ErrorAction SilentlyContinue
+            $AutologonConfigured = $true
+        }
+    } catch {
+        Write-Host "${BrandYellow}-> WARNING: Sysinternals Autologon failed. Falling back to registry method. $_${ResetColor}"
+    }
+    Remove-Item -Path $AutologonZip -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $AutologonDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+if (-not $AutologonConfigured) {
+    Set-ItemProperty -Path $WinLogonPath -Name "AutoAdminLogon" -Value "1"
+    Set-ItemProperty -Path $WinLogonPath -Name "DefaultUserName" -Value $TargetUser
+    Set-ItemProperty -Path $WinLogonPath -Name "DefaultPassword" -Value $PlainPass
+}
 Remove-ItemProperty -Path $WinLogonPath -Name "AutoLogonCOUNT" -ErrorAction SilentlyContinue
+$PlainPass = $null
 
-Write-Host "${BrandDark}-> Auto-Logon configured for account: $TargetUser${ResetColor}"
+$AutologonMethod = if ($AutologonConfigured) { "encrypted LSA secret" } else { "registry" }
+Write-Host "${BrandDark}-> Auto-Logon configured for account: $TargetUser ($AutologonMethod)${ResetColor}"
 
 # ==========================================
 # MODULE 3: WINDOWS 10 CONSOLE DEBLOAT & OPTIMIZATION
 # ==========================================
-Write-Host "`n${BrandGreen}[3/7] Debloating & Optimizing Windows 10...${ResetColor}"
+Write-Host "`n${BrandGreen}[3/8] Debloating & Optimizing Windows 10...${ResetColor}"
 
 Write-Host "${BrandDark}-> Disabling Telemetry & Diagnostic Services...${ResetColor}"
 $PoliciesPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection"
@@ -122,6 +157,7 @@ Get-Service -Name "dmwappushservice" -ErrorAction SilentlyContinue | Set-Service
 
 $UnusedServices = @(
     "SysMain",          # Prevents CPU/Disk spikes (Superfetch)
+    "WSearch",          # Windows Search indexer (constant background disk/CPU usage, Start Menu search unused)
     "Spooler",          # Print Spooler (no printer needed on a couch console)
     "MapsBroker",       # Downloaded Maps Manager
     "Fax",              # Fax service
@@ -255,6 +291,65 @@ Set-ItemProperty -Path $ContentDeliveryPath -Name "SubscribedContent-310093Enabl
 $DesktopPanelPath = "HKCU:\Control Panel\Desktop"
 Set-ItemProperty -Path $DesktopPanelPath -Name "MenuShowDelay" -Value "200" -ErrorAction SilentlyContinue
 
+Write-Host "${BrandDark}-> Reducing visual effects (transparency, animations, Aero Peek)...${ResetColor}"
+$VisualEffectsPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"
+if (-not (Test-Path $VisualEffectsPath)) { New-Item -Path $VisualEffectsPath -Force | Out-Null }
+Set-ItemProperty -Path $VisualEffectsPath -Name "VisualFXSetting" -Value 3 -Type DWord -ErrorAction SilentlyContinue  # Custom (keeps font smoothing for TV readability)
+$WindowMetricsPath = "HKCU:\Control Panel\Desktop\WindowMetrics"
+if (-not (Test-Path $WindowMetricsPath)) { New-Item -Path $WindowMetricsPath -Force | Out-Null }
+Set-ItemProperty -Path $WindowMetricsPath -Name "MinAnimate" -Value "0" -ErrorAction SilentlyContinue
+Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "TaskbarAnimations" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+$TransparencyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+if (-not (Test-Path $TransparencyPath)) { New-Item -Path $TransparencyPath -Force | Out-Null }
+Set-ItemProperty -Path $TransparencyPath -Name "EnableTransparency" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+$DWMPerfPath = "HKCU:\Software\Microsoft\Windows\DWM"
+if (-not (Test-Path $DWMPerfPath)) { New-Item -Path $DWMPerfPath -Force | Out-Null }
+Set-ItemProperty -Path $DWMPerfPath -Name "EnableAeroPeek" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+
+Write-Host "${BrandDark}-> Disabling notification toasts (no popups over games)...${ResetColor}"
+$PushNotificationsPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotifications"
+if (-not (Test-Path $PushNotificationsPath)) { New-Item -Path $PushNotificationsPath -Force | Out-Null }
+Set-ItemProperty -Path $PushNotificationsPath -Name "ToastEnabled" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+
+Write-Host "${BrandDark}-> Blocking background apps...${ResetColor}"
+$AppPrivacyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy"
+if (-not (Test-Path $AppPrivacyPath)) { New-Item -Path $AppPrivacyPath -Force | Out-Null }
+Set-ItemProperty -Path $AppPrivacyPath -Name "LetAppsRunInBackground" -Value 2 -Type DWord  # 2 = Force Deny
+$BackgroundAppsPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications"
+if (-not (Test-Path $BackgroundAppsPath)) { New-Item -Path $BackgroundAppsPath -Force | Out-Null }
+Set-ItemProperty -Path $BackgroundAppsPath -Name "GlobalUserDisabled" -Value 1 -Type DWord -ErrorAction SilentlyContinue
+
+Write-Host "${BrandDark}-> Disabling Delivery Optimization peer-to-peer update sharing...${ResetColor}"
+$DeliveryOptimizationPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization"
+if (-not (Test-Path $DeliveryOptimizationPath)) { New-Item -Path $DeliveryOptimizationPath -Force | Out-Null }
+Set-ItemProperty -Path $DeliveryOptimizationPath -Name "DODownloadMode" -Value 0 -Type DWord  # 0 = HTTP only, no peering
+
+Write-Host "${BrandDark}-> Setting Windows Update to notify before downloading (no surprise installs/reboots mid-game)...${ResetColor}"
+$WindowsUpdateAUPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
+if (-not (Test-Path $WindowsUpdateAUPath)) { New-Item -Path $WindowsUpdateAUPath -Force | Out-Null }
+Set-ItemProperty -Path $WindowsUpdateAUPath -Name "NoAutoUpdate" -Value 0 -Type DWord
+Set-ItemProperty -Path $WindowsUpdateAUPath -Name "AUOptions" -Value 2 -Type DWord  # 2 = Notify before download
+Set-ItemProperty -Path $WindowsUpdateAUPath -Name "NoAutoRebootWithLoggedOnUsers" -Value 1 -Type DWord
+
+Write-Host "${BrandDark}-> Prioritizing games (Game Mode, GPU scheduling, multimedia scheduler)...${ResetColor}"
+$GameBarPath = "HKCU:\Software\Microsoft\GameBar"
+if (-not (Test-Path $GameBarPath)) { New-Item -Path $GameBarPath -Force | Out-Null }
+Set-ItemProperty -Path $GameBarPath -Name "AllowAutoGameMode" -Value 1 -Type DWord -ErrorAction SilentlyContinue
+Set-ItemProperty -Path $GameBarPath -Name "AutoGameModeEnabled" -Value 1 -Type DWord -ErrorAction SilentlyContinue
+
+# Hardware-accelerated GPU scheduling; ignored by Windows when the GPU/driver does not support it (needs WDDM 2.7+)
+$GraphicsDriversPath = "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
+Set-ItemProperty -Path $GraphicsDriversPath -Name "HwSchMode" -Value 2 -Type DWord -ErrorAction SilentlyContinue
+
+$SystemProfilePath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
+Set-ItemProperty -Path $SystemProfilePath -Name "SystemResponsiveness" -Value 10 -Type DWord -ErrorAction SilentlyContinue
+$GamesTaskPath = "$SystemProfilePath\Tasks\Games"
+if (-not (Test-Path $GamesTaskPath)) { New-Item -Path $GamesTaskPath -Force | Out-Null }
+Set-ItemProperty -Path $GamesTaskPath -Name "GPU Priority" -Value 8 -Type DWord -ErrorAction SilentlyContinue
+Set-ItemProperty -Path $GamesTaskPath -Name "Priority" -Value 6 -Type DWord -ErrorAction SilentlyContinue
+Set-ItemProperty -Path $GamesTaskPath -Name "Scheduling Category" -Value "High" -ErrorAction SilentlyContinue
+Set-ItemProperty -Path $GamesTaskPath -Name "SFIO Priority" -Value "High" -ErrorAction SilentlyContinue
+
 $AdvancedExplorerPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
 if (-not (Test-Path $AdvancedExplorerPath)) { New-Item -Path $AdvancedExplorerPath -Force | Out-Null }
 Set-ItemProperty -Path $AdvancedExplorerPath -Name "DisallowShaking" -Value 1 -Type DWord -ErrorAction SilentlyContinue
@@ -333,7 +428,7 @@ Write-Host "${BrandDark}-> Windows 10 Console debloating and branding completed.
 # ==========================================
 # MODULE 4: PLAYNITE INSTALLATION
 # ==========================================
-Write-Host "`n${BrandGreen}[4/7] Installing Playnite...${ResetColor}"
+Write-Host "`n${BrandGreen}[4/8] Installing Playnite...${ResetColor}"
 $PlayniteInstaller = Join-Path -Path $ScriptDir -ChildPath "PlayniteInstaller.exe"
 
 if (-not (Test-Path $PlayniteInstaller)) {
@@ -362,7 +457,7 @@ if (Test-Path $PlayniteInstaller) {
 # ==========================================
 # MODULE 5: GAME LAUNCHERS SELECTION
 # ==========================================
-Write-Host "`n${BrandGreen}[5/7] Configuring Game Launchers...${ResetColor}"
+Write-Host "`n${BrandGreen}[5/8] Configuring Game Launchers...${ResetColor}"
 
 function Install-Launcher {
     param (
@@ -391,7 +486,7 @@ function Install-Launcher {
 
     $fileName = Split-Path $DownloadUrl -Leaf
     if ($fileName -notlike "*.*") {
-        $fileName = "$Name-Installer" + (if ($IsMsi) { ".msi" } else { ".exe" })
+        $fileName = "$Name-Installer" + $(if ($IsMsi) { ".msi" } else { ".exe" })
     }
     $installerPath = Join-Path -Path $ScriptDir -ChildPath $fileName
     
@@ -449,10 +544,168 @@ if (-not [string]::IsNullOrWhiteSpace($Selection)) {
     Write-Host "${BrandDark}-> No launchers selected. Skipping.${ResetColor}"
 }
 
+# Launchers register themselves to autostart and idle in the background (often 1-2 GB RAM combined).
+# Playnite starts them on demand, so their Run entries are removed. Also reused at logon in Standard Startup Mode,
+# since some launchers (e.g. Steam) re-add their entry on first run.
+$LauncherCleanupScript = @'
+$LauncherPatterns = @('steam\.exe', 'EpicGamesLauncher\.exe', 'EADesktop\.exe', 'EALauncher\.exe', 'upc\.exe', 'UbisoftConnect\.exe', 'GalaxyClient\.exe', 'Battle\.net( Launcher)?\.exe', 'itch\.exe')
+$RunKeys = @(
+    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run',
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'
+)
+foreach ($RunKey in $RunKeys) {
+    $Values = Get-ItemProperty -Path $RunKey -ErrorAction SilentlyContinue
+    if ($null -eq $Values) { continue }
+    foreach ($Prop in $Values.PSObject.Properties) {
+        if ($Prop.Name -in @('PSPath', 'PSParentPath', 'PSChildName', 'PSDrive', 'PSProvider')) { continue }
+        foreach ($Pattern in $LauncherPatterns) {
+            if ([string]$Prop.Value -match $Pattern) {
+                Remove-ItemProperty -Path $RunKey -Name $Prop.Name -ErrorAction SilentlyContinue
+                break
+            }
+        }
+    }
+}
+'@
+Write-Host "${BrandDark}-> Removing game launcher autostart entries (Playnite launches them on demand)...${ResetColor}"
+& ([scriptblock]::Create($LauncherCleanupScript))
+
 # ==========================================
-# MODULE 6: HACKBGRT SETUP
+# MODULE 6: ROMM INTEGRATION (OPTIONAL)
 # ==========================================
-Write-Host "`n${BrandGreen}[6/7] Launching HackBGRT Setup...${ResetColor}"
+Write-Host "`n${BrandGreen}[6/8] Configuring RomM Integration...${ResetColor}"
+
+function Read-SecretInput {
+    param ([string]$Prompt)
+    $Secure = Read-Host $Prompt -AsSecureString
+    $SecretBSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
+    try {
+        return [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($SecretBSTR)
+    } finally {
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($SecretBSTR)
+    }
+}
+
+$RomMChoice = Read-Host "Do you have a RomM server to connect Playnite to? (Y/N)"
+if ($RomMChoice -match '^[Yy]$') {
+    # Official RomM Playnite plugin: https://github.com/rommapp/playnite-plugin
+    $RomMPluginId = "9700aa21-447d-41b4-a989-acd38f407d9f"
+    $PlayniteDataDir = "$env:AppData\Playnite"
+
+    $RomMHost = ""
+    while ($RomMHost -notmatch '^https?://[^\s/]+') {
+        $RomMHost = (Read-Host "RomM server URL (e.g. http://192.168.1.50:8080)").Trim().TrimEnd('/')
+        if ($RomMHost -notmatch '^https?://[^\s/]+') {
+            Write-Host "Invalid URL! It must start with http:// or https://" -ForegroundColor Red
+        }
+    }
+
+    try {
+        Invoke-WebRequest -Uri "$RomMHost/api/heartbeat" -UseBasicParsing -TimeoutSec 15 | Out-Null
+        Write-Host "${BrandDark}-> RomM server is reachable at $RomMHost.${ResetColor}"
+    } catch {
+        Write-Host "${BrandYellow}-> WARNING: Could not reach $RomMHost/api/heartbeat. Continuing anyway; you can fix the URL later in Playnite. $_${ResetColor}"
+    }
+
+    $RomMAuthChoice = ""
+    while ($RomMAuthChoice -ne "1" -and $RomMAuthChoice -ne "2") {
+        Write-Host "`nChoose how Playnite should authenticate with RomM:" -ForegroundColor Cyan
+        Write-Host "1) API token (Recommended: an rmm_... token created in your RomM profile, revocable at any time)"
+        Write-Host "2) Username & password (use a dedicated account with the VIEWER role)"
+        $RomMAuthChoice = (Read-Host "Choice (1 or 2)").Trim()
+        if ($RomMAuthChoice -ne "1" -and $RomMAuthChoice -ne "2") {
+            Write-Host "Invalid choice! Please enter 1 or 2." -ForegroundColor Red
+        }
+    }
+
+    $RomMUseBasicAuth = ($RomMAuthChoice -eq "2")
+    $RomMUsername = ""
+    $RomMPassword = ""
+    $RomMToken = ""
+    if ($RomMUseBasicAuth) {
+        while ([string]::IsNullOrWhiteSpace($RomMUsername)) {
+            $RomMUsername = (Read-Host "RomM username").Trim()
+        }
+        while ([string]::IsNullOrEmpty($RomMPassword)) {
+            $RomMPassword = Read-SecretInput "RomM password"
+        }
+    } else {
+        # Same format the plugin validates against before connecting
+        while ($RomMToken -notmatch '^rmm_[0-9a-f]{64}$') {
+            $RomMToken = (Read-SecretInput "RomM API token").Trim()
+            if ($RomMToken -notmatch '^rmm_[0-9a-f]{64}$') {
+                Write-Host "Invalid token! It should look like rmm_ followed by 64 hex characters." -ForegroundColor Red
+            }
+        }
+    }
+
+    Write-Host "${BrandYellow}-> Downloading the latest RomM Playnite plugin...${ResetColor}"
+    $RomMPluginDir = Join-Path -Path $PlayniteDataDir -ChildPath "Extensions\RomM_$RomMPluginId"
+    $RomMPluginZip = Join-Path -Path $ScriptDir -ChildPath "RomM-plugin.zip"  # .pext is a zip archive; Expand-Archive only accepts .zip
+    $ProgressPreference = 'SilentlyContinue'
+    $RomMPluginInstalled = $false
+    try {
+        $RomMRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/rommapp/playnite-plugin/releases/latest" -UseBasicParsing
+        $RomMAsset = $RomMRelease.assets | Where-Object { $_.name -like "*.pext" } | Select-Object -First 1
+        if ($null -eq $RomMAsset) { throw "No .pext asset found in release $($RomMRelease.tag_name)." }
+        Download-File -Uri $RomMAsset.browser_download_url -Path $RomMPluginZip
+
+        # Playnite must not be running while its extensions and their settings are changed
+        Stop-Process -Name "Playnite.DesktopApp", "Playnite.FullscreenApp" -Force -ErrorAction SilentlyContinue
+        if (Test-Path $RomMPluginDir) { Remove-Item -Path $RomMPluginDir -Recurse -Force }
+        New-Item -Path $RomMPluginDir -ItemType Directory -Force | Out-Null
+        Expand-Archive -Path $RomMPluginZip -DestinationPath $RomMPluginDir -Force
+        $RomMPluginInstalled = $true
+        Write-Host "${BrandDark}-> RomM plugin $($RomMRelease.tag_name) installed to $RomMPluginDir.${ResetColor}"
+    } catch {
+        Write-Host "${BrandRed}-> ERROR: Failed to download or install the RomM plugin. $_${ResetColor}"
+    }
+    Remove-Item -Path $RomMPluginZip -Force -ErrorAction SilentlyContinue
+
+    if ($RomMPluginInstalled) {
+        # Pre-fill the plugin's own settings file, merging into an existing one so mappings from a previous setup are kept
+        $RomMConfigDir = Join-Path -Path $PlayniteDataDir -ChildPath "ExtensionsData\$RomMPluginId"
+        $RomMConfigPath = Join-Path -Path $RomMConfigDir -ChildPath "config.json"
+        if (-not (Test-Path $RomMConfigDir)) { New-Item -Path $RomMConfigDir -ItemType Directory -Force | Out-Null }
+
+        $RomMConfig = $null
+        if (Test-Path $RomMConfigPath) {
+            try { $RomMConfig = Get-Content -Path $RomMConfigPath -Raw | ConvertFrom-Json } catch { $RomMConfig = $null }
+        }
+        if ($null -eq $RomMConfig) { $RomMConfig = New-Object PSObject }
+
+        $RomMSettings = [ordered]@{
+            RomMHost              = $RomMHost
+            UseBasicAuth          = $RomMUseBasicAuth
+            RomMUsername          = $RomMUsername
+            RomMPassword          = $RomMPassword
+            RomMClientToken       = $RomMToken
+            ScanGamesInFullScreen = $true
+        }
+        foreach ($Key in $RomMSettings.Keys) {
+            $RomMConfig | Add-Member -NotePropertyName $Key -NotePropertyValue $RomMSettings[$Key] -Force
+        }
+        [System.IO.File]::WriteAllText($RomMConfigPath, ($RomMConfig | ConvertTo-Json -Depth 20), (New-Object System.Text.UTF8Encoding $false))
+        Write-Host "${BrandDark}-> RomM server and credentials saved to the plugin settings.${ResetColor}"
+
+        Write-Host "${BrandYellow}-> One-time step left: emulator mappings live in Playnite's database and can't be scripted.${ResetColor}"
+        Write-Host "   After setup, open Playnite in Desktop mode (keyboard/mouse) and:" -ForegroundColor Yellow
+        Write-Host "   1. Library > Configure Emulators > Import, to detect an installed emulator (e.g. RetroArch, option 8 above)." -ForegroundColor Yellow
+        Write-Host "   2. Library > Configure Integrations > RomM > add a mapping (emulator, profile, platform, ROM folder)." -ForegroundColor Yellow
+        Write-Host "   3. Library > Import RomM library." -ForegroundColor Yellow
+        Write-Host "   Note: your RomM server needs IGDB API credentials configured for the plugin to work." -ForegroundColor Yellow
+    }
+    $RomMPassword = $null
+    $RomMToken = $null
+} else {
+    Write-Host "${BrandDark}-> No RomM server. Skipping.${ResetColor}"
+}
+
+# ==========================================
+# MODULE 7: HACKBGRT SETUP
+# ==========================================
+Write-Host "`n${BrandGreen}[7/8] Launching HackBGRT Setup...${ResetColor}"
 $HackBGRTDir = Join-Path -Path $ScriptDir -ChildPath "HackBGRT-2.6.0"
 $HackBGRTSetup = Join-Path -Path $HackBGRTDir -ChildPath "setup.exe"
 
@@ -496,9 +749,9 @@ if (Test-Path $HackBGRTSetup) {
 }
 
 # ==========================================
-# MODULE 7: AUTO-START PLAYNITE & SHELL MODE
+# MODULE 8: AUTO-START PLAYNITE & SHELL MODE
 # ==========================================
-Write-Host "`n${BrandGreen}[7/7] Setting up Playnite Console Boot Mode & Controller Mouse Emulation...${ResetColor}"
+Write-Host "`n${BrandGreen}[8/8] Setting up Playnite Console Boot Mode & Controller Mouse Emulation...${ResetColor}"
 
 $ConsoleDir = "C:\PessimoConsole"
 if (-not (Test-Path $ConsoleDir)) {
@@ -508,6 +761,22 @@ if (-not (Test-Path $ConsoleDir)) {
 if (Get-Command Add-MpPreference -ErrorAction SilentlyContinue) {
     Write-Host "${BrandDark}-> Adding Windows Defender exclusion for $ConsoleDir...${ResetColor}"
     Add-MpPreference -ExclusionPath $ConsoleDir -ErrorAction SilentlyContinue
+
+    # Skips real-time scanning of game files, which speeds up game loading at the cost of less malware coverage there
+    Write-Host "${BrandDark}-> Adding Windows Defender exclusions for game library folders...${ResetColor}"
+    $GameLibraryDirs = @(
+        "${env:ProgramFiles(x86)}\Steam\steamapps",
+        "$env:ProgramFiles\Epic Games",
+        "${env:ProgramFiles(x86)}\GOG Galaxy\Games",
+        "$env:ProgramFiles\EA Games",
+        "${env:ProgramFiles(x86)}\Ubisoft\Ubisoft Game Launcher\games",
+        "$env:AppData\itch\apps",
+        "$env:SystemDrive\RetroArch-Win64",
+        "$env:LocalAppData\Playnite"
+    )
+    foreach ($GameDir in $GameLibraryDirs) {
+        Add-MpPreference -ExclusionPath $GameDir -ErrorAction SilentlyContinue
+    }
 }
 
 $GopherExe = Join-Path -Path $ConsoleDir -ChildPath "Gopher360.exe"
@@ -585,6 +854,7 @@ start explorer.exe
         
         Remove-ItemProperty -Path $StartupRegistryPath -Name "PlayniteTVMode" -ErrorAction SilentlyContinue
         Remove-ItemProperty -Path $StartupRegistryPath -Name "Gopher360" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $StartupRegistryPath -Name "PessimoLauncherCleanup" -ErrorAction SilentlyContinue
         Write-Host "${BrandDark}-> Configured launcher batch script as custom shell. Booting will now load Playnite directly!${ResetColor}"
         
         $RestoreScriptPath = Join-Path -Path $ConsoleDir -ChildPath "RestoreExplorerShell.bat"
@@ -594,7 +864,7 @@ echo ==========================================
 echo       RESTORE WINDOWS EXPLORER SHELL
 echo ==========================================
 reg delete "HKCU\Software\Microsoft\Windows NT\CurrentVersion\Winlogon" /v Shell /f
-taskkill /f /im Playnite.FullscreenCmd.exe >nul 2>&1
+taskkill /f /im Playnite.FullscreenApp.exe >nul 2>&1
 taskkill /f /im Playnite.DesktopApp.exe >nul 2>&1
 taskkill /f /im Gopher360.exe >nul 2>&1
 start explorer.exe
@@ -620,13 +890,21 @@ pause
         Set-ItemProperty -Path $StartupRegistryPath -Name "PlayniteTVMode" -Value $FormattedPlayniteExe
         
         Set-ItemProperty -Path $StartupRegistryPath -Name "Gopher360" -Value "`"$GopherExe`""
-        
+
+        $LauncherCleanupPath = Join-Path -Path $ConsoleDir -ChildPath "CleanLauncherStartup.ps1"
+        $LauncherCleanupScript | Out-File -FilePath $LauncherCleanupPath -Encoding ascii -Force
+        Set-ItemProperty -Path $StartupRegistryPath -Name "PessimoLauncherCleanup" -Value "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$LauncherCleanupPath`""
+
         Remove-ItemProperty -Path $WinlogonRegistryPath -Name "Shell" -ErrorAction SilentlyContinue
         Write-Host "${BrandDark}-> Playnite and Gopher360 configured to launch on standard Windows startup.${ResetColor}"
     }
 } else {
     Write-Host "${BrandYellow}-> WARNING: Playnite executable path not resolved. Cannot configure boot mode.${ResetColor}"
 }
+
+Write-Host "`n${BrandGreen}-> Cleaning up superseded Windows component files (this can take several minutes)...${ResetColor}"
+Dism.exe /Online /Cleanup-Image /StartComponentCleanup
+Write-Host "${BrandDark}-> Component store cleanup finished.${ResetColor}"
 
 Write-Host "`n${BrandAccent}==========================================${ResetColor}"
 Write-Host "${BrandAccent}      PESSIMOCONSOLE SETUP COMPLETE!      ${ResetColor}"
